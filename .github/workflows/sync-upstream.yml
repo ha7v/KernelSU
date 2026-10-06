@@ -1,0 +1,113 @@
+name: Sync Upstream & Build
+
+on:
+  schedule:
+    # 每天 UTC 18:00 (北京时间凌晨 2:00) 自动检查并追新
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force trigger build even if already up to date'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync-and-trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Check upstream, sync and trigger
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          git remote add upstream https://github.com/tiann/KernelSU.git 2>/dev/null || true
+          git fetch upstream main
+
+          LOCAL_BASE=$(git merge-base HEAD upstream/main)
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+
+          echo "Local merge-base: $LOCAL_BASE"
+          echo "Upstream HEAD:    $UPSTREAM_HEAD"
+
+          if [ "$LOCAL_BASE" = "$UPSTREAM_HEAD" ]; then
+            echo "Already up-to-date with upstream/main."
+            if [ "${{ inputs.force_build }}" = "true" ]; then
+              echo "force_build is requested, dispatching Build Manager workflow..."
+              gh workflow run build-manager.yml --ref main
+              echo "Workflow dispatch submitted."
+            else
+              echo "No build requested. Done."
+            fi
+            exit 0
+          fi
+
+          echo "New upstream commits detected! Rebasing onto upstream/main..."
+
+          resolve_conflicts() {
+            if git status --porcelain | grep -q "kernel/Kbuild"; then
+              echo "Auto-resolving kernel/Kbuild..."
+              git checkout --ours kernel/Kbuild
+              sed -i 's/expr 30000 +/expr 30007 +/' kernel/Kbuild
+              sed -i 's/KSU_PACKAGE_NAME ?= me.weishu.kernelsu/KSU_PACKAGE_NAME ?= cc.ha7.v/' kernel/Kbuild
+              sed -i 's/KSU_EXPECTED_SIZE ?= 0x033b/KSU_EXPECTED_SIZE ?= 0x02c2/' kernel/Kbuild
+              sed -i 's/KSU_EXPECTED_HASH ?= c371061b19d8c7d7d6133c6a9bafe198fa944e50c1b31c9d8daa8d7f1fc2d2d6/KSU_EXPECTED_HASH ?= ad82dabe12c9722dbd256b546584638c92d6e9e989425425d96fa62511775652/' kernel/Kbuild
+              git add kernel/Kbuild
+            fi
+
+            if git status --porcelain | grep -q "manager/app/build.gradle.kts"; then
+              echo "Auto-resolving manager/app/build.gradle.kts..."
+              git checkout --ours manager/app/build.gradle.kts
+              sed -i 's/defaultManagerPackageName = if (isPrBuild) "me.weishu.kernelsu.pr" else "me.weishu.kernelsu"/defaultManagerPackageName = if (isPrBuild) "me.weishu.kernelsu.pr" else "cc.ha7.v"/' manager/app/build.gradle.kts
+              git add manager/app/build.gradle.kts
+            fi
+
+            if git status --porcelain | grep -q "manager/build.gradle.kts"; then
+              echo "Auto-resolving manager/build.gradle.kts..."
+              git checkout --ours manager/build.gradle.kts
+              sed -i 's/30000 + commitCount/30007 + commitCount/' manager/build.gradle.kts
+              git add manager/build.gradle.kts
+            fi
+
+            if git status --porcelain | grep -q "userspace/ksud/build.rs"; then
+              echo "Auto-resolving userspace/ksud/build.rs..."
+              git checkout --ours userspace/ksud/build.rs
+              sed -i 's/30000 + version_code/30007 + version_code/' userspace/ksud/build.rs
+              sed -i 's/cargo:rustc-env=KSU_PACKAGE_NAME=me.weishu.kernelsu/cargo:rustc-env=KSU_PACKAGE_NAME=cc.ha7.v/' userspace/ksud/build.rs
+              git add userspace/ksud/build.rs
+            fi
+
+            if git status --porcelain | grep -q "\.github/workflows/"; then
+              echo "Auto-resolving .github/workflows/ keeping custom workflows..."
+              git checkout --theirs .github/workflows/
+              git add .github/workflows/
+            fi
+          }
+
+          if ! git rebase upstream/main; then
+            echo "Conflict detected during rebase, applying self-healing resolver..."
+            while [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]; do
+              resolve_conflicts
+              GIT_EDITOR=true git rebase --continue || break
+            done
+          fi
+
+          echo "Pushing rebased main branch to origin..."
+          git push --force-with-lease origin main
+          echo "Branch pushed successfully. PAT push will trigger Build Manager automatically."
+
