@@ -1,0 +1,84 @@
+name: Sync Upstream & Build
+
+on:
+  schedule:
+    # 每天每 6 小时自动检查并追新上游
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force re-sync and trigger build even if already up to date'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync-and-trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync upstream (Reset strategy) and trigger build
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          git remote add upstream https://github.com/tiann/KernelSU.git 2>/dev/null || true
+          git fetch upstream main
+
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          echo "Upstream HEAD: $UPSTREAM_HEAD"
+
+          # 检查当前分支是否已经基于 upstream/main 的最新 commit
+          # 在 Force-Reset 单 commit 策略下，HEAD~1 即为所基于的 upstream commit
+          PARENT_SHA=$(git rev-parse HEAD~1 2>/dev/null || echo "")
+          FORCE_BUILD="${{ inputs.force_build }}"
+
+          if [ "$PARENT_SHA" = "$UPSTREAM_HEAD" ] && [ "$FORCE_BUILD" != "true" ]; then
+            echo "Already aligned with upstream/main ($UPSTREAM_HEAD) and force_build is false. Done."
+            exit 0
+          fi
+
+          echo "Applying upstream update via clean reset..."
+
+          # 备份自定义文件（本工作流及改包名补丁脚本）
+          TMP_DIR=$(mktemp -d)
+          cp .github/workflows/sync-upstream.yml "$TMP_DIR/sync-upstream.yml"
+          cp .github/scripts/apply-fork-identity.py "$TMP_DIR/apply-fork-identity.py"
+
+          # 纯净重置到上游最新分支
+          git reset --hard upstream/main
+
+          # 还原自定义脚本与工作流
+          mkdir -p .github/workflows .github/scripts
+          cp "$TMP_DIR/sync-upstream.yml" .github/workflows/sync-upstream.yml
+          cp "$TMP_DIR/apply-fork-identity.py" .github/scripts/apply-fork-identity.py
+
+          # 执行自动补丁脚本（修改包名、签名、版本号，并注入 build-manager 发布步骤）
+          python3 .github/scripts/apply-fork-identity.py
+
+          # 打包为单一提交（保证在 GitHub 上恒定只 ahead 1 个 commit）
+          git add -A
+          UPSTREAM_SHORT=$(git rev-parse --short upstream/main)
+          git commit -m "manager: Apply fork identity (upstream: $UPSTREAM_SHORT)"
+
+          echo "Pushing cleanly to origin/main (force)..."
+          git push origin main --force
+          echo "Branch pushed successfully."
+
+          echo "Triggering Build Manager workflow..."
+          gh workflow run build-manager.yml -R "$GITHUB_REPOSITORY" --ref main
+          echo "Build Manager workflow dispatched successfully."
