@@ -1,0 +1,101 @@
+name: Sync Upstream & Build
+
+on:
+  schedule:
+    # Check and sync upstream every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force trigger build even if already up to date with upstream'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync-and-trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Keep scheduled workflow alive
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # Refresh GitHub's 60-day scheduled workflow inactivity timer on public forks
+          if [ -n "$GH_TOKEN" ]; then
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/sync-upstream.yml/enable" || true
+          fi
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync upstream and dispatch build
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          git remote add upstream https://github.com/tiann/KernelSU.git 2>/dev/null || true
+          git fetch upstream main
+
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          COMMIT_WORDS=$(git rev-list --parents -n 1 HEAD | wc -w)
+          PARENT_SHA=$(git rev-parse HEAD~1 2>/dev/null || echo "")
+          FORCE_BUILD="${{ inputs.force_build }}"
+
+          echo "Upstream HEAD : $UPSTREAM_HEAD"
+          echo "Parent SHA    : $PARENT_SHA (commit words: $COMMIT_WORDS)"
+
+          # Clean sync means HEAD is a single non-merge commit directly on top of upstream/main
+          IS_CLEAN_SYNC=false
+          if [ "$COMMIT_WORDS" -eq 2 ] && [ "$PARENT_SHA" = "$UPSTREAM_HEAD" ]; then
+            IS_CLEAN_SYNC=true
+          fi
+
+          if [ "$IS_CLEAN_SYNC" = "true" ] && [ "$FORCE_BUILD" != "true" ]; then
+            echo "Already aligned with upstream/main ($UPSTREAM_HEAD) and force_build is false. Done."
+            exit 0
+          fi
+
+          if [ "$IS_CLEAN_SYNC" != "true" ]; then
+            echo "Applying upstream update via clean reset..."
+            TMP_DIR=$(mktemp -d)
+            cp .github/workflows/sync-upstream.yml "$TMP_DIR/sync-upstream.yml"
+            cp .github/scripts/apply-fork-identity.py "$TMP_DIR/apply-fork-identity.py"
+
+            git reset --hard upstream/main
+
+            mkdir -p .github/workflows .github/scripts
+            cp "$TMP_DIR/sync-upstream.yml" .github/workflows/sync-upstream.yml
+            cp "$TMP_DIR/apply-fork-identity.py" .github/scripts/apply-fork-identity.py
+
+            python3 .github/scripts/apply-fork-identity.py
+
+            git add -A
+            UPSTREAM_SHORT=$(git rev-parse --short upstream/main)
+            # [skip ci] prevents redundant push workflows (Clippy/Website/duplicate Build Manager);
+            # Build Manager is explicitly dispatched once below.
+            git commit -m "manager: Apply fork identity (upstream: $UPSTREAM_SHORT) [skip ci]"
+
+            echo "Pushing cleanly to origin/main (force)..."
+            git push origin main --force
+          else
+            echo "Branch already aligned; skipping git push and triggering forced build only."
+          fi
+
+          echo "Dispatching Build Manager workflow..."
+          gh workflow run build-manager.yml -R "$GITHUB_REPOSITORY" --ref main
+          echo "Build Manager workflow dispatched successfully."

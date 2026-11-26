@@ -37,6 +37,11 @@ on:
       - 'Cargo.toml'
   workflow_call:
 
+  workflow_dispatch:
+concurrency:
+  group: build-manager-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   generate-key:
     runs-on: ubuntu-latest
@@ -118,28 +123,6 @@ jobs:
       pack_lkm: true
       pack_ksuinit: true
   
-  build-ksud-extra:
-    needs: [build-lkm, build-ksuinit]
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-pc-windows-gnu # windows pc
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin # Intel mac
-            os: macos-latest
-          - target: aarch64-apple-darwin # M chip mac
-            os: macos-latest
-          - target: aarch64-unknown-linux-musl # arm64 Linux
-            os: ubuntu-latest
-          - target: x86_64-unknown-linux-musl # x86 Linux
-            os: ubuntu-latest
-    uses: ./.github/workflows/ksud-extra.yml
-    with:
-      target: ${{ matrix.target }}
-      os: ${{ matrix.os }}
-      pack_lkm: true
-      pack_ksuinit: true
-
   build-manager:
     needs: [generate-key]
     if: always() && needs.generate-key.result == 'success'
@@ -196,7 +179,7 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             ./gradlew clean assembleRelease -PIS_PR_BUILD=true
           else
-            ./gradlew clean assembleRelease
+            ./gradlew clean assembleRelease || (echo "Retrying Gradle build..." && sleep 5 && ./gradlew assembleRelease)
           fi
 
       - name: Upload build artifact
@@ -218,6 +201,8 @@ jobs:
     if: always() && needs.build-manager.result == 'success' && needs.build-ksud.result == 'success' && needs.generate-key.result == 'success'
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -325,6 +310,35 @@ jobs:
           name: manager
           path: dist/*.apk
 
+
+      - name: Publish Release
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          APK=$(ls dist/*.apk 2>/dev/null | head -n 1)
+          if [ -n "$APK" ] && [ -f "$APK" ]; then
+            APK_NAME=$(basename "$APK")
+            TAG="continuous"
+            TITLE="ha7 (${GITHUB_SHA:0:8})"
+            NOTES="Automated build of ha7 (\`cc.ha7.v\`) based on commit \`${GITHUB_SHA:0:8}\`."
+            if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Uploading $APK_NAME to existing release $TAG..."
+              gh release upload "$TAG" "$APK" -R "$GITHUB_REPOSITORY" --clobber
+              OLD_ASSETS=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name | select(. != \"$APK_NAME\")")
+              while IFS= read -r asset; do
+                if [ -n "$asset" ]; then
+                  echo "Removing old asset: $asset"
+                  gh release delete-asset "$TAG" "$asset" -R "$GITHUB_REPOSITORY" --yes
+                fi
+              done <<< "$OLD_ASSETS"
+              gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$TITLE" --notes "$NOTES"
+            else
+              echo "Creating new release $TAG..."
+              gh release create "$TAG" "$APK" -R "$GITHUB_REPOSITORY" --title "$TITLE" --notes "$NOTES" --prerelease
+            fi
+            echo "Release published successfully."
+          fi
       - name: Upload to telegram
         if: github.event_name != 'pull_request' && steps.need_upload.outputs.UPLOAD == 'true'
         env:
